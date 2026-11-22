@@ -1,0 +1,22 @@
+{
+  "name": "@lutraman/pi-bifrost-budget",
+  "version": "1.0.0",
+  "description": "Display the current Bifrost daily budget in Pi",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/bifrost-daily-budget.ts"
+    ]
+  }
+}
