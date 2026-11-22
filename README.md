@@ -4,9 +4,9 @@ A Pi extension that displays the current Bifrost one-day virtual-key budget in t
 
 ## Requirements
 
-- Pi coding agent
-- A Bifrost provider configured in Pi's `models.json`
-- The provider must define an `x-bf-vk` header, either directly or through a value stored in Pi's `auth.json`
+- Pi coding agent 1.6 or later
+- A Bifrost provider with an HTTPS API endpoint
+- A virtual key configured either as an `X-Bf-Vk` request header or as a bearer API key beginning with `sk-bf-`. Pi resolves the credentials for the active model; no duplicate key or header is needed.
 
 ## Usage
 
@@ -19,9 +19,13 @@ pi install npm:@lutraman/pi-bifrost-budget
 The extension displays usage and the effective daily limit in the status bar, for example:
 
 ```text
-12.34$/100.00$
+Bifrost 12.34$/100.00$
 ```
 
 The status refreshes when a session starts, after model selection, after an agent run, and every 60 seconds. Run `/bifrost-budget` to refresh manually.
 
-The extension reads the configured Bifrost connection from Pi's local configuration and sends the virtual key only to the configured Bifrost quota endpoint. Credentials are not included in this package.
+The extension sends the virtual key only to the active model's HTTPS quota endpoint and does not follow redirects. It shows a warning when the lookup fails and hides the budget on unrelated providers.
+
+## Tests
+
+Run `npm test` with Node.js 24.

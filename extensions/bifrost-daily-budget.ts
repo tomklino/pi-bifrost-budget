@@ -1,160 +1,111 @@
-import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import type {
-	ExtensionAPI,
-	ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const STATUS_KEY = "bifrost-daily-budget";
 const REFRESH_INTERVAL_MS = 60_000;
-const PI_AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+const QUOTA_PATH = "/api/governance/virtual-keys/quota";
 
-type JsonObject = Record<string, unknown>;
+class BudgetError extends Error {}
 
-type Budget = {
-	max_limit?: number;
-	current_usage?: number;
-	reset_duration?: string;
-	override_amount?: number;
-};
-
-async function readJson(path: string): Promise<JsonObject> {
-	return JSON.parse(await readFile(path, "utf8")) as JsonObject;
+function isBifrostProvider(provider: string | undefined): boolean {
+	return /^bifrost(?:[-_.]|$)/i.test(provider ?? "");
 }
 
-function asObject(value: unknown): JsonObject | undefined {
-	return value !== null && typeof value === "object" && !Array.isArray(value)
-		? (value as JsonObject)
-		: undefined;
-}
+async function readDailyBudget(ctx: ExtensionContext): Promise<string | undefined> {
+	const model = ctx.model;
+	if (!model) return;
 
-/** Resolve the same $ENV header reference Pi uses, including values stored in auth.json. */
-async function getBifrostConnection(providerName: string): Promise<{
-	quotaUrl: URL;
-	virtualKey: string;
-} | undefined> {
-	const [modelsFile, authFile] = await Promise.all([
-		readJson(join(PI_AGENT_DIR, "models.json")),
-		readJson(join(PI_AGENT_DIR, "auth.json")),
-	]);
-
-	const providers = asObject(modelsFile.providers);
-	const provider = asObject(providers?.[providerName]);
-	const baseUrl = provider?.baseUrl;
-	if (typeof baseUrl !== "string") return undefined;
-
-	const headers = asObject(provider.headers);
-	const virtualKeyHeader = Object.entries(headers ?? {}).find(
-		([name]) => name.toLowerCase() === "x-bf-vk",
-	);
-	if (!virtualKeyHeader || typeof virtualKeyHeader[1] !== "string") return undefined;
-
-	const auth = asObject(authFile[providerName]);
-	const authEnv = asObject(auth?.env);
-	const configuredValue = virtualKeyHeader[1];
-	let virtualKey = configuredValue;
-	if (configuredValue.startsWith("$") && configuredValue.length > 1) {
-		const variable = configuredValue.slice(1);
-		const storedValue = authEnv?.[variable];
-		virtualKey = process.env[variable]
-			?? (typeof storedValue === "string" ? storedValue : undefined)
-			?? (typeof auth?.key === "string" ? auth.key : undefined)
-			?? "";
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+	if (!auth.ok) {
+		if (isBifrostProvider(model.provider)) throw new BudgetError("could not resolve the virtual key");
+		return;
 	}
-	if (!virtualKey) return undefined;
 
-	const quotaUrl = new URL(baseUrl);
-	quotaUrl.pathname = "/api/governance/virtual-keys/quota";
-	quotaUrl.search = "";
-	quotaUrl.hash = "";
-	return { quotaUrl, virtualKey };
-}
+	// Use Pi's resolved request credentials, not a second interpretation of models.json/auth.json.
+	const headers = new Headers();
+	for (const [name, value] of Object.entries(auth.headers ?? {})) {
+		if (value === null) headers.delete(name);
+		else headers.set(name, value);
+	}
+	const vkHeader = headers.get("x-bf-vk");
+	const authorization = headers.get("authorization");
+	const bearer = authorization === null ? auth.apiKey : /^Bearer\s+(\S+)$/i.exec(authorization)?.[1];
+	const virtualKey = vkHeader || (bearer?.startsWith("sk-bf-") ? bearer : undefined);
+	if (!virtualKey) {
+		if (isBifrostProvider(model.provider)) throw new BudgetError("no virtual key configured");
+		return;
+	}
 
-async function fetchDailyBudget(providerName: string): Promise<Budget | undefined> {
-	const connection = await getBifrostConnection(providerName);
-	if (!connection) return undefined;
-
-	const response = await fetch(connection.quotaUrl, {
-		headers: { "x-bf-vk": connection.virtualKey },
+	const url = new URL(QUOTA_PATH, auth.baseUrl ?? model.baseUrl);
+	if (url.protocol !== "https:") throw new BudgetError("quota endpoint must use HTTPS");
+	const response = await fetch(url, {
+		headers: { "X-Bf-Vk": virtualKey },
+		redirect: "error",
 		signal: AbortSignal.timeout(10_000),
 	});
-	if (!response.ok) {
-		throw new Error(`Bifrost quota request returned HTTP ${response.status}`);
-	}
+	if (!response.ok) throw new BudgetError(`quota request returned HTTP ${response.status}`);
 
-	const body = asObject(await response.json());
-	const budgets = Array.isArray(body?.budgets) ? (body.budgets as Budget[]) : [];
-	return budgets.find(
-		(budget) => budget.reset_duration?.toLowerCase() === "1d"
-			&& Number.isFinite(budget.current_usage)
-			&& Number.isFinite(budget.max_limit),
-	);
+	const body = await response.json() as { budgets?: unknown } | null;
+	if (Array.isArray(body?.budgets)) {
+		for (const budget of body.budgets) {
+			if (typeof budget?.reset_duration !== "string" || budget.reset_duration.toLowerCase() !== "1d") continue;
+			const { current_usage: used, max_limit: limit, override_amount: override } = budget;
+			if (!Number.isFinite(used) || !Number.isFinite(limit) || (override != null && !Number.isFinite(override))) continue;
+			const total = limit + (override ?? 0);
+			if (Number.isFinite(total)) return `${used.toFixed(2)}$/${total.toFixed(2)}$`;
+		}
+	}
+	throw new BudgetError("quota response contains no valid daily budget");
 }
 
 export default function (pi: ExtensionAPI) {
 	let timer: ReturnType<typeof setInterval> | undefined;
-	let refreshGeneration = 0;
-	let activeContext: ExtensionContext | undefined;
+	let generation = 0;
 
-	const refresh = async (ctx: ExtensionContext, reportError = false) => {
-		const generation = ++refreshGeneration;
-		const provider = ctx.model?.provider;
-		if (!provider) {
-			ctx.ui.setStatus(STATUS_KEY, undefined);
-			return;
-		}
-
+	const refresh = async (ctx: ExtensionContext, manual = false) => {
+		const request = ++generation;
 		try {
-			const budget = await fetchDailyBudget(provider);
-			if (generation !== refreshGeneration) return;
-			if (!budget) {
-				ctx.ui.setStatus(STATUS_KEY, undefined);
-				return;
-			}
-
-			const used = budget.current_usage!;
-			const total = budget.max_limit! + (budget.override_amount ?? 0);
-			ctx.ui.setStatus(STATUS_KEY, `${used.toFixed(2)}$/${total.toFixed(2)}$`);
+			const budget = await readDailyBudget(ctx);
+			if (request !== generation) return;
+			ctx.ui.setStatus(STATUS_KEY, budget ? ctx.ui.theme.fg("dim", `Bifrost ${budget}`) : undefined);
+			if (!budget && manual) ctx.ui.notify("The active model is not using a Bifrost virtual key.", "info");
 		} catch (error) {
-			if (generation !== refreshGeneration) return;
-			ctx.ui.setStatus(STATUS_KEY, undefined);
-			if (reportError && ctx.hasUI) {
-				ctx.ui.notify(
-					`Could not read Bifrost daily budget: ${error instanceof Error ? error.message : String(error)}`,
-					"error",
-				);
-			}
+			if (request !== generation) return;
+			// Do not surface arbitrary auth errors or response bodies, which may include secrets.
+			const detail = error instanceof BudgetError ? error.message
+				: error instanceof Error && error.name === "TimeoutError" ? "request timed out" : "unavailable";
+			ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("warning", `Bifrost budget: ${detail} (/bifrost-budget)`));
+			if (manual) ctx.ui.notify(`Bifrost budget: ${detail}.`, "error");
 		}
 	};
 
-	pi.on("session_start", async (_event, ctx) => {
+	const refreshSelection = (ctx: ExtensionContext) => {
+		ctx.ui.setStatus(STATUS_KEY, isBifrostProvider(ctx.model?.provider)
+			? ctx.ui.theme.fg("dim", "Bifrost budget: loading…") : undefined);
+		void refresh(ctx);
+	};
+
+	pi.on("session_start", (_event, ctx) => {
 		if (ctx.mode !== "tui") return;
-		activeContext = ctx;
-		await refresh(ctx);
+		refreshSelection(ctx);
 		timer = setInterval(() => void refresh(ctx), REFRESH_INTERVAL_MS);
 	});
 
-	pi.on("model_select", async (_event, ctx) => {
-		if (ctx.mode === "tui") await refresh(ctx);
+	pi.on("model_select", (_event, ctx) => {
+		if (ctx.mode === "tui") refreshSelection(ctx);
 	});
 
-	pi.on("agent_end", async (_event, ctx) => {
-		if (ctx.mode === "tui") await refresh(ctx);
+	pi.on("agent_end", (_event, ctx) => {
+		if (ctx.mode === "tui") void refresh(ctx);
 	});
 
 	pi.registerCommand("bifrost-budget", {
 		description: "Refresh the Bifrost daily budget status",
-		handler: async (_args, ctx) => {
-			await refresh(ctx, true);
-		},
+		handler: async (_args, ctx) => refresh(ctx, true),
 	});
 
-	pi.on("session_shutdown", async () => {
-		refreshGeneration++;
-		if (timer) clearInterval(timer);
+	pi.on("session_shutdown", () => {
+		generation++;
+		clearInterval(timer);
 		timer = undefined;
-		activeContext?.ui.setStatus(STATUS_KEY, undefined);
-		activeContext = undefined;
 	});
 }
