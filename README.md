@@ -1,4 +1,4 @@
-# @lutraman/pi-bifrost-budget
+# pi-bifrost-budget
 
 A Pi extension that displays the current Bifrost one-day virtual-key budget in the status bar.
 
@@ -13,7 +13,7 @@ A Pi extension that displays the current Bifrost one-day virtual-key budget in t
 Install the package with:
 
 ```bash
-pi install npm:@lutraman/pi-bifrost-budget
+pi install npm:pi-bifrost-budget
 ```
 
 The extension displays usage and the effective daily limit in the status bar, for example:

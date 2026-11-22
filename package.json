@@ -1,12 +1,16 @@
 {
-  "name": "@lutraman/pi-bifrost-budget",
-  "version": "1.0.0",
+  "name": "pi-bifrost-budget",
+  "version": "1.0.1",
   "description": "Display the current Bifrost daily budget in Pi",
   "keywords": [
     "pi-package"
   ],
   "license": "MIT",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tomklino/pi-bifrost-budget.git"
+  },
   "files": [
     "extensions",
     "README.md",
